@@ -1,0 +1,102 @@
+diff --git a/io/papermc/paper/exactperf/NearestPlayerQuery.java b/io/papermc/paper/exactperf/NearestPlayerQuery.java
+new file mode 100644
+index 0000000..27995d8
+--- /dev/null
++++ b/io/papermc/paper/exactperf/NearestPlayerQuery.java
+@@ -0,0 +1,7 @@
++package io.papermc.paper.exactperf;
++
++/** Exact query pruning; disable with -Dexactperf.nearest-player-pruning=false for A/B or rollback. */
++public final class NearestPlayerQuery {
++    public static final boolean ENABLED = Boolean.parseBoolean(System.getProperty("exactperf.nearest-player-pruning", "true"));
++    private NearestPlayerQuery() {}
++}
+diff --git a/net/minecraft/world/entity/InsideBlockEffectApplier.java b/net/minecraft/world/entity/InsideBlockEffectApplier.java
+index fc7cfc7..22c1851 100644
+--- a/net/minecraft/world/entity/InsideBlockEffectApplier.java
++++ b/net/minecraft/world/entity/InsideBlockEffectApplier.java
+@@ -41,6 +41,8 @@ public interface InsideBlockEffectApplier {
+         );
+         private final List<Consumer<Entity>> finalEffects = new ArrayList<>();
+         private int lastStep = -1;
++        // ExactPerf: flushing empty lists allocates ten temporary arrays per step.
++        private boolean exactPerfHasPendingEffects;
+ 
+         public void advanceStep(final int step, net.minecraft.core.BlockPos pos) { // Paper - track position inside effect was triggered on
+             this.currentBlockPos = pos; // Paper - track position inside effect was triggered on
+@@ -66,33 +68,42 @@ public interface InsideBlockEffectApplier {
+         }
+ 
+         private void flushStep() {
++            if (!this.exactPerfHasPendingEffects) return;
++            this.exactPerfHasPendingEffects = false;
+             for (InsideBlockEffectType type : APPLY_ORDER) {
+                 List<Consumer<Entity>> beforeEffects = this.beforeEffectsInStep.get(type);
+-                this.finalEffects.addAll(beforeEffects);
+-                beforeEffects.clear();
++                if (!beforeEffects.isEmpty()) {
++                    this.finalEffects.addAll(beforeEffects);
++                    beforeEffects.clear();
++                }
+                 if (this.effectsInStep.remove(type) instanceof final Consumer<Entity> recordedEffect) { // Paper - track position inside effect was triggered on - better than null check to avoid diff.
+                     this.finalEffects.add(recordedEffect); // Paper - track position inside effect was triggered on
+                 }
+ 
+                 List<Consumer<Entity>> afterEffects = this.afterEffectsInStep.get(type);
+-                this.finalEffects.addAll(afterEffects);
+-                afterEffects.clear();
++                if (!afterEffects.isEmpty()) {
++                    this.finalEffects.addAll(afterEffects);
++                    afterEffects.clear();
++                }
+             }
+         }
+ 
+         @Override
+         public void apply(final InsideBlockEffectType type) {
+-            this.effectsInStep.put(type, recorded(type)); // Paper - track position inside effect was triggered on
++            this.effectsInStep.put(type, recorded(type));
++            this.exactPerfHasPendingEffects = true; // Paper - track position inside effect was triggered on
+         }
+ 
+         @Override
+         public void runBefore(final InsideBlockEffectType type, final Consumer<Entity> effect) {
+             this.beforeEffectsInStep.get(type).add(effect);
++            this.exactPerfHasPendingEffects = true;
+         }
+ 
+         @Override
+         public void runAfter(final InsideBlockEffectType type, final Consumer<Entity> effect) {
+             this.afterEffectsInStep.get(type).add(effect);
++            this.exactPerfHasPendingEffects = true;
+         }
+ 
+         // Paper start - track position inside effect was triggered on
+diff --git a/net/minecraft/world/level/EntityGetter.java b/net/minecraft/world/level/EntityGetter.java
+index f3f26db..01d9618 100644
+--- a/net/minecraft/world/level/EntityGetter.java
++++ b/net/minecraft/world/level/EntityGetter.java
+@@ -128,8 +128,22 @@ public interface EntityGetter extends ca.spottedleaf.moonrise.patches.chunk_syst
+         double best = -1.0;
+         Player result = null;
+ 
++        // ExactPerf: only built-in read-only selectors on the exact vanilla ServerPlayer
++        // may be pruned before evaluating the predicate. Custom callbacks/subclasses
++        // keep the original predicate-before-distance evaluation and encounter order.
++        final boolean prune = io.papermc.paper.exactperf.NearestPlayerQuery.ENABLED
++            && (predicate == EntitySelector.PLAYER_AFFECTS_SPAWNING
++                || predicate == EntitySelector.NO_SPECTATORS
++                || predicate == EntitySelector.NO_CREATIVE_OR_SPECTATOR);
+         for (Player player : this.getLocalPlayers()) { // Folia - region threading
+-            if (predicate == null || predicate.test(player)) {
++            if (prune && player.getClass() == net.minecraft.server.level.ServerPlayer.class) {
++                final double dist = player.distanceToSqr(x, y, z);
++                if ((range < 0.0 || dist < range * range) && (best == -1.0 || dist < best)
++                    && predicate.test(player)) {
++                    best = dist;
++                    result = player;
++                }
++            } else if (predicate == null || predicate.test(player)) {
+                 double dist = player.distanceToSqr(x, y, z);
+                 if ((range < 0.0 || dist < range * range) && (best == -1.0 || dist < best)) {
+                     best = dist;

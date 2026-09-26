@@ -1,0 +1,193 @@
+diff --git a/io/papermc/paper/exactperf/ParallelDistanceOrder.java b/io/papermc/paper/exactperf/ParallelDistanceOrder.java
+new file mode 100644
+index 0000000..eec15ad
+--- /dev/null
++++ b/io/papermc/paper/exactperf/ParallelDistanceOrder.java
+@@ -0,0 +1,124 @@
++package io.papermc.paper.exactperf;
++
++import java.util.concurrent.ForkJoinPool;
++import java.util.concurrent.RecursiveAction;
++import java.util.concurrent.Semaphore;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.LongAdder;
++
++/** Bounded pure numeric work. Workers never retain entity, world or plugin objects. */
++public final class ParallelDistanceOrder {
++    private ParallelDistanceOrder() {}
++    private static final int WORKERS = Math.max(1, Math.min(4, Runtime.getRuntime().availableProcessors() - 1));
++    private static final Semaphore SLOTS = new Semaphore(2);
++    private static final ForkJoinPool POOL = new ForkJoinPool(WORKERS, pool -> {
++        var thread = ForkJoinPool.defaultForkJoinWorkerThreadFactory.newThread(pool);
++        thread.setName("ExactPerf-Sensor-Math-" + thread.threadId());
++        thread.setDaemon(true);
++        return thread;
++    }, null, false);
++    public static final LongAdder parallelCompleted = new LongAdder();
++    public static final LongAdder fallback = new LongAdder();
++
++    /** Caller keeps its own copy; even a timed-out worker cannot observe future input changes. */
++    public static int[] order(final double[] input, final boolean parallel) {
++        if (!parallel || input.length < 1024 || input.length > 65536 || WORKERS < 2 || !SLOTS.tryAcquire()) {
++            if (parallel) fallback.increment();
++            return sequential(input);
++        }
++        final double[] snapshot;
++        final int[] indexes;
++        final int[] scratch;
++        try {
++            snapshot = input.clone();
++            indexes = indexes(input.length);
++            scratch = new int[input.length];
++        } catch (Throwable failure) {
++            SLOTS.release();
++            throw failure;
++        }
++        final var task = new RecursiveAction() {
++            @Override protected void compute() {
++                try { new Sort(snapshot, indexes, scratch, 0, indexes.length).invoke(); }
++                finally { SLOTS.release(); }
++            }
++        };
++        try {
++            POOL.execute(task);
++        } catch (java.util.concurrent.RejectedExecutionException rejected) {
++            SLOTS.release();
++            fallback.increment();
++            return sequential(input);
++        }
++        try {
++            task.get(2, TimeUnit.MILLISECONDS);
++            parallelCompleted.increment();
++            return indexes;
++        } catch (InterruptedException interrupted) {
++            Thread.currentThread().interrupt();
++        } catch (java.util.concurrent.TimeoutException | java.util.concurrent.ExecutionException failed) {
++            // The abandoned task owns its arrays and permit until it really finishes.
++        }
++        fallback.increment();
++        return sequential(input);
++    }
++
++    public static int[] sequential(final double[] values) {
++        int[] indexes = indexes(values.length);
++        sort(values, indexes, new int[values.length], 0, values.length);
++        return indexes;
++    }
++
++    private static int[] indexes(int size) {
++        int[] result = new int[size];
++        for (int i = 0; i < size; ++i) result[i] = i;
++        return result;
++    }
++
++    private static boolean before(double[] keys, int a, int b) {
++        int compare = Double.compare(keys[a], keys[b]);
++        return compare < 0 || compare == 0 && a < b;
++    }
++
++    private static void sort(double[] keys, int[] indexes, int[] scratch, int lo, int hi) {
++        if (hi - lo < 24) {
++            for (int i = lo + 1; i < hi; ++i) {
++                int value = indexes[i], j = i;
++                while (j > lo && before(keys, value, indexes[j - 1])) {
++                    indexes[j] = indexes[j - 1];
++                    --j;
++                }
++                indexes[j] = value;
++            }
++            return;
++        }
++        int mid = (lo + hi) >>> 1;
++        sort(keys, indexes, scratch, lo, mid);
++        sort(keys, indexes, scratch, mid, hi);
++        merge(keys, indexes, scratch, lo, mid, hi);
++    }
++
++    private static void merge(double[] keys, int[] indexes, int[] scratch, int lo, int mid, int hi) {
++        if (!before(keys, indexes[mid], indexes[mid - 1])) return;
++        int a = lo, b = mid;
++        for (int i = lo; i < hi; ++i) {
++            scratch[i] = b >= hi || a < mid && before(keys, indexes[a], indexes[b]) ? indexes[a++] : indexes[b++];
++        }
++        System.arraycopy(scratch, lo, indexes, lo, hi - lo);
++    }
++
++    private static final class Sort extends RecursiveAction {
++        private final double[] keys;
++        private final int[] indexes, scratch;
++        private final int lo, hi;
++        Sort(double[] keys, int[] indexes, int[] scratch, int lo, int hi) {
++            this.keys = keys; this.indexes = indexes; this.scratch = scratch; this.lo = lo; this.hi = hi;
++        }
++        @Override protected void compute() {
++            if (hi - lo <= 512) { sort(keys, indexes, scratch, lo, hi); return; }
++            int mid = (lo + hi) >>> 1;
++            invokeAll(new Sort(keys, indexes, scratch, lo, mid), new Sort(keys, indexes, scratch, mid, hi));
++            merge(keys, indexes, scratch, lo, mid, hi);
++        }
++    }
++}
+diff --git a/io/papermc/paper/exactperf/ParallelNearestEntities.java b/io/papermc/paper/exactperf/ParallelNearestEntities.java
+new file mode 100644
+index 0000000..c4d7815
+--- /dev/null
++++ b/io/papermc/paper/exactperf/ParallelNearestEntities.java
+@@ -0,0 +1,42 @@
++package io.papermc.paper.exactperf;
++
++import java.util.List;
++import net.minecraft.world.entity.Entity;
++import net.minecraft.world.entity.LivingEntity;
++import net.minecraft.world.phys.Vec3;
++import ca.spottedleaf.moonrise.common.util.TickThread;
++
++/** Capture and publish on the owning region. Original comparator remains the compatibility fallback. */
++public final class ParallelNearestEntities {
++    private ParallelNearestEntities() {}
++    private static final boolean ENABLED = Boolean.getBoolean("exactperf.parallel-sensors");
++    private static final ClassValue<Boolean> DEFAULT_DISTANCE = new ClassValue<>() {
++        @Override protected Boolean computeValue(Class<?> type) {
++            try {
++                return type.getMethod("distanceToSqr", Entity.class).getDeclaringClass() == Entity.class
++                    && type.getMethod("distanceToSqr", Vec3.class).getDeclaringClass() == Entity.class;
++            } catch (ReflectiveOperationException | SecurityException unsupported) { return false; }
++        }
++    };
++    private static final ClassValue<Boolean> DEFAULT_POSITION = new ClassValue<>() {
++        @Override protected Boolean computeValue(Class<?> type) {
++            try { return type.getMethod("position").getDeclaringClass() == Entity.class; }
++            catch (ReflectiveOperationException | SecurityException unsupported) { return false; }
++        }
++    };
++
++    public static boolean sort(final LivingEntity body, final List<LivingEntity> entities) {
++        if (!ENABLED || entities.size() < 1024 || entities.size() > 65536
++            || !DEFAULT_DISTANCE.get(body.getClass()) || !TickThread.isTickThreadFor(body)) return false;
++        // Cross-region entities and plugin overrides retain the exact original call path.
++        for (LivingEntity entity : entities) {
++            if (!DEFAULT_POSITION.get(entity.getClass()) || !TickThread.isTickThreadFor(entity)) return false;
++        }
++        LivingEntity[] references = entities.toArray(LivingEntity[]::new);
++        double[] distances = new double[references.length];
++        for (int i = 0; i < distances.length; ++i) distances[i] = body.distanceToSqr(references[i]);
++        int[] order = ParallelDistanceOrder.order(distances, true);
++        for (int i = 0; i < order.length; ++i) entities.set(i, references[order[i]]);
++        return true;
++    }
++}
+diff --git a/net/minecraft/world/entity/ai/sensing/NearestLivingEntitySensor.java b/net/minecraft/world/entity/ai/sensing/NearestLivingEntitySensor.java
+index 3578ece..f81ffaa 100644
+--- a/net/minecraft/world/entity/ai/sensing/NearestLivingEntitySensor.java
++++ b/net/minecraft/world/entity/ai/sensing/NearestLivingEntitySensor.java
+@@ -18,7 +18,9 @@ public class NearestLivingEntitySensor<T extends LivingEntity> extends Sensor<T>
+         double followRange = body.getAttributeValue(Attributes.FOLLOW_RANGE);
+         AABB boundingBox = body.getBoundingBox().inflate(followRange, followRange, followRange);
+         List<LivingEntity> livingEntities = level.getEntitiesOfClass(LivingEntity.class, boundingBox, mob -> mob != body && mob.isAlive());
+-        livingEntities.sort(Comparator.comparingDouble(body::distanceToSqr));
++        if (!io.papermc.paper.exactperf.ParallelNearestEntities.sort(body, livingEntities)) {
++            livingEntities.sort(Comparator.comparingDouble(body::distanceToSqr));
++        }
+         Brain<?> brain = body.getBrain();
+         brain.setMemory(MemoryModuleType.NEAREST_LIVING_ENTITIES, livingEntities);
+         brain.setMemory(MemoryModuleType.NEAREST_VISIBLE_LIVING_ENTITIES, new NearestVisibleLivingEntities(level, body, livingEntities));

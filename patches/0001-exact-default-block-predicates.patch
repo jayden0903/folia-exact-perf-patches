@@ -1,0 +1,50 @@
+diff --git a/net/minecraft/world/level/block/state/BlockBehaviour.java b/net/minecraft/world/level/block/state/BlockBehaviour.java
+index c78d770..fd286df 100644
+--- a/net/minecraft/world/level/block/state/BlockBehaviour.java
++++ b/net/minecraft/world/level/block/state/BlockBehaviour.java
+@@ -756,6 +756,11 @@ public abstract class BlockBehaviour implements FeatureElement {
+         }
+ 
+         public boolean isRedstoneConductor(final BlockGetter level, final BlockPos pos) {
++            // ExactPerf: specialize only the exact built-in pure predicate. Its shape
++            // query already uses this cache; custom/dynamic predicates stay intact.
++            if (this.cache != null && this.isRedstoneConductor == Properties.DEFAULT_REDSTONE_CONDUCTOR) {
++                return this.cache.isCollisionShapeFullBlock;
++            }
+             return this.isRedstoneConductor.test(this.asState(), level, pos);
+         }
+ 
+@@ -945,10 +950,20 @@ public abstract class BlockBehaviour implements FeatureElement {
+         }
+ 
+         public boolean isSuffocating(final BlockGetter level, final BlockPos pos) {
++            // ExactPerf: specialize only the exact built-in pure predicate. Its shape
++            // query already uses this cache; custom/dynamic predicates stay intact.
++            if (this.cache != null && this.isSuffocating == Properties.DEFAULT_SUFFOCATING) {
++                return this.blocksMotion() && this.cache.isCollisionShapeFullBlock;
++            }
+             return this.isSuffocating.test(this.asState(), level, pos);
+         }
+ 
+         public boolean isViewBlocking(final BlockGetter level, final BlockPos pos) {
++            // ExactPerf: specialize only the exact built-in pure predicate. Its shape
++            // query already uses this cache; custom/dynamic predicates stay intact.
++            if (this.cache != null && this.isViewBlocking == Properties.DEFAULT_SUFFOCATING) {
++                return this.blocksMotion() && this.cache.isCollisionShapeFullBlock;
++            }
+             return this.isViewBlocking.test(this.asState(), level, pos);
+         }
+ 
+@@ -1153,8 +1168,10 @@ public abstract class BlockBehaviour implements FeatureElement {
+                 level, pos, Direction.UP
+             )
+             && state.getLightEmission() < 14;
+-        private BlockBehaviour.StatePredicate isRedstoneConductor = BlockBehaviour.BlockStateBase::isCollisionShapeFullBlock;
+-        private BlockBehaviour.StatePredicate isSuffocating = (state, level, pos) -> state.blocksMotion() && state.isCollisionShapeFullBlock(level, pos);
++        private static final BlockBehaviour.StatePredicate DEFAULT_REDSTONE_CONDUCTOR = BlockBehaviour.BlockStateBase::isCollisionShapeFullBlock;
++        private static final BlockBehaviour.StatePredicate DEFAULT_SUFFOCATING = (state, level, pos) -> state.blocksMotion() && state.isCollisionShapeFullBlock(level, pos);
++        private BlockBehaviour.StatePredicate isRedstoneConductor = DEFAULT_REDSTONE_CONDUCTOR;
++        private BlockBehaviour.StatePredicate isSuffocating = DEFAULT_SUFFOCATING;
+         private BlockBehaviour.StatePredicate isViewBlocking = this.isSuffocating;
+         private BlockBehaviour.PostProcess postProcess = (state, level, pos) -> null;
+         private Predicate<BlockState> emissiveRendering = var0 -> false;
